@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import folder_paths
 
+__version__ = "1.1.0"
+
 try:
     import imageio_ffmpeg
 except Exception:
@@ -468,12 +470,15 @@ def _prepare_sticker_object(sticker, sticker_mask, invert_loadimage_mask, outlin
 
     # Recover the original person alpha (without outline) by eroding, so the
     # content bbox excludes the white outline.  Erosion inverts LC_Sticker's dilation.
-    if outline_px > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                      (int(outline_px) * 2 + 1, int(outline_px) * 2 + 1))
-        alpha_raw = cv2.erode(alpha, k)
-    else:
+    # outline_px < 0 = no outline (skip erosion); otherwise erode at least 1px
+    # to match LC_Sticker's guaranteed minimum 1px outline.
+    if int(outline_px) < 0:
         alpha_raw = alpha
+    else:
+        eff_outline = max(1, int(outline_px))
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (eff_outline * 2 + 1, eff_outline * 2 + 1))
+        alpha_raw = cv2.erode(alpha, k)
 
     ys, xs = np.where(alpha > 0.03)
     if len(xs) == 0:
@@ -547,7 +552,7 @@ class DressMorphSequence:
             "move_frames": ("INT", {"default": 4, "min": 4, "max": 60, "step": 1}),
             "cut_move_frame": ("INT", {"default": 3, "min": 1, "max": 59, "step": 1}),
             "menu_height": ("FLOAT", {"default": 0.28, "min": 0.05, "max": 0.60, "step": 0.01}),
-            "outline_px": ("INT", {"default": 5, "min": 0, "max": 80, "step": 1}),
+            "outline_px": ("INT", {"default": 5, "min": -1, "max": 80, "step": 1}),
             "motion_blur": ("INT", {"default": 7, "min": 0, "max": 51, "step": 1}),
             "cursor_size": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
             "invert_loadimage_mask": ("BOOLEAN", {"default": False}),
@@ -758,6 +763,272 @@ class DressMorphSequence:
         return (_to_tensor(np.stack(output)),)
 
 
+class DressMorphLeftRise:
+    """Show the first three stickers one by one, then fly and rise the queue on the left.
+    After video_0 ends, the first sticker flies to the person while the remaining stickers rise.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "video_0": ("IMAGE",),
+            "video_1": ("IMAGE",),
+            "video_2": ("IMAGE",),
+            "video_3": ("IMAGE",),
+            "video_4": ("IMAGE",),
+            "video_5": ("IMAGE",),
+            "video_6": ("IMAGE",),
+            "sticker_0": ("IMAGE",), "mask_0": ("MASK",),
+            "sticker_1": ("IMAGE",), "mask_1": ("MASK",),
+            "sticker_2": ("IMAGE",), "mask_2": ("MASK",),
+            "sticker_3": ("IMAGE",), "mask_3": ("MASK",),
+            "sticker_4": ("IMAGE",), "mask_4": ("MASK",),
+            "sticker_5": ("IMAGE",), "mask_5": ("MASK",),
+            "rise_top_y": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 0.50, "step": 0.01}),
+            "rise_stagger": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 0.60, "step": 0.01}),
+            "menu_x": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "rise_start_y": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "trigger_hold_frames": ("INT", {"default": 6, "min": 1, "max": 30, "step": 1}),
+            "menu_size_ratio": ("FLOAT", {"default": 0.16, "min": 0.05, "max": 0.40, "step": 0.01}),
+            "outline_px": ("INT", {"default": 5, "min": -1, "max": 80, "step": 1}),
+            "invert_loadimage_mask": ("BOOLEAN", {"default": False}),
+        }, "optional": {
+            "intro_animation": (["无", "震动", "向左上甩入"], {"default": "震动"}),
+            "intro_animation_frames": ("INT", {"default": 10, "min": 3, "max": 30, "step": 1}),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("frames",)
+    FUNCTION = "compose"
+    CATEGORY = "DressMorph/换装转场"
+
+    def compose(self, video_0, video_1, video_2, video_3, video_4, video_5, video_6,
+                sticker_0, mask_0, sticker_1, mask_1, sticker_2, mask_2,
+                sticker_3, mask_3, sticker_4, mask_4, sticker_5, mask_5,
+                rise_top_y, rise_stagger, menu_x, rise_start_y,
+                trigger_hold_frames, menu_size_ratio,
+                outline_px, invert_loadimage_mask,
+                intro_animation="震动", intro_animation_frames=10):
+        sticker_inputs = [sticker_0, sticker_1, sticker_2, sticker_3, sticker_4, sticker_5]
+        mask_inputs = [mask_0, mask_1, mask_2, mask_3, mask_4, mask_5]
+        active_slots = [i for i, (s, m) in enumerate(zip(sticker_inputs, mask_inputs))
+                        if s is not None and m is not None]
+        n_stickers = len(active_slots)
+        if n_stickers < 2:
+            raise RuntimeError("至少需要连接 2 张贴图（带对应 MASK）才能跑左侧飞升换装。")
+        if n_stickers > 6:
+            raise RuntimeError("最多支持 6 张贴图。")
+
+        videos_in = [video_0, video_1, video_2, video_3, video_4, video_5, video_6]
+        first = _to_uint8(videos_in[0])
+        if len(first) == 0:
+            raise RuntimeError("video_0 没有视频帧。")
+        h, w = first.shape[1:3]
+        videos = [first] + [_resize_video_to(v, w, h) for v in videos_in[1:n_stickers + 1]]
+        while len(videos) < n_stickers + 1:
+            v = videos[-1]
+            videos.append(np.repeat(v[-1:], 1, axis=0))
+        for i, v in enumerate(videos):
+            if len(v) == 0:
+                raise RuntimeError(f"video_{i} 没有视频帧。")
+
+        queue = list(active_slots)
+        objects = {slot: _prepare_sticker_object(sticker_inputs[slot], mask_inputs[slot],
+                                                invert_loadimage_mask, int(outline_px))
+                   for slot in active_slots}
+
+        slice_bboxes = []
+        for i in range(n_stickers):
+            bbox = _detect_person_bbox(videos[i + 1][0])
+            if bbox is None:
+                raise RuntimeError(
+                    f"video_{i + 1} 第一帧 U²-Net 未检测到清晰人物，"
+                    "无法自动确定切片位置。请检查该段视频首帧是否包含完整人物轮廓。"
+                )
+            slice_bboxes.append(bbox)
+
+        # --- State ---
+        stagger_px = float(rise_stagger) * float(h)
+        menu_h_px = float(menu_size_ratio) * float(h)
+        # rise_top_y is the top margin; _render_object expects the sticker center.
+        top_y_px = float(rise_top_y) * float(h) + menu_h_px / 2.0
+        # The first three stickers occupy the top/middle/bottom positions. Any later
+        # stickers wait below the frame and enter with the same synchronized rise.
+        sticker_y = [top_y_px + float(i) * stagger_px for i in range(n_stickers)]
+        states = ["rising"] * n_stickers  # rising / flying / done
+        flying_idx = -1
+        flying_remaining = 0
+        video_seg = 0
+        video_fi = 0
+        output = []
+
+        # video_0 is an introduction: stickers 0/1/2 appear at 0, 1/3 and 2/3 of
+        # the segment and remain stationary. Rising starts when sticker 0 takes off.
+        intro_count = min(3, n_stickers)
+        intro_len = max(1, len(videos[0]))
+        intro_appear_frames = [min(intro_len - 1, int(math.floor(float(i) * intro_len / 3.0)))
+                               for i in range(intro_count)]
+        intro_anim_frames = max(3, int(intro_animation_frames))
+        flight_frames = max(3, int(trigger_hold_frames))
+        cur_speed = 0.0
+
+        def get_bg_frame(seg, fi):
+            v = videos[seg] if seg < len(videos) else videos[-1]
+            if fi < len(v):
+                return v[fi]
+            return v[-1]
+
+        max_frames = 30 * 120  # safety cap (120s @ 30fps)
+        frames_rendered = 0
+        while frames_rendered < max_frames:
+            all_done = all(s == "done" for s in states)
+            if all_done and video_seg >= n_stickers and video_fi >= len(videos[-1]):
+                break
+
+            base = get_bg_frame(video_seg, video_fi).copy()
+            out = base
+
+            # Pass 1: during video_0, reveal only the first three stickers one by one.
+            # After the first takeoff, render every remaining sticker so later ones can
+            # rise naturally into the frame from below.
+            for i in range(n_stickers):
+                if states[i] != "rising":
+                    continue
+                if video_seg == 0:
+                    if i >= intro_count or video_fi < intro_appear_frames[i]:
+                        continue
+                premul, alpha, _ = objects[queue[i]]
+                render_x = menu_x * w
+                render_y = sticker_y[i]
+                render_h = menu_h_px
+                render_angle = 0.0
+                render_opacity = 1.0
+                if video_seg == 0 and i < intro_count and intro_animation != "无":
+                    appear_fi = intro_appear_frames[i]
+                    available_frames = max(1, intro_len - appear_fi)
+                    anim_n = min(intro_anim_frames, available_frames)
+                    local_fi = max(0, video_fi - appear_fi)
+                    if anim_n <= 1:
+                        t = 1.0
+                    else:
+                        t = min(1.0, float(local_fi) / float(anim_n - 1))
+                    if intro_animation == "震动":
+                        decay = (1.0 - t) ** 2
+                        phase = 5.0 * math.pi * t
+                        render_x += math.sin(phase) * 0.018 * w * decay
+                        render_y += math.cos(phase * 1.13) * 0.012 * h * decay
+                        render_angle = math.sin(phase * 1.27) * 5.0 * decay
+                        render_h *= 1.0 + 0.12 * math.sin(math.pi * t) * decay
+                        render_opacity = min(1.0, t * 2.5)
+                    elif intro_animation == "向左上甩入":
+                        ease = _ease_out_cubic(t)
+                        remain = 1.0 - ease
+                        render_x += 0.20 * w * remain
+                        render_y += 0.14 * h * remain
+                        render_angle = 14.0 * remain
+                        render_h *= 0.88 + 0.12 * ease
+                        render_opacity = min(1.0, t * 3.0)
+                wrgb, wa = _render_object(premul, alpha, w, h,
+                                          render_x, render_y, render_h, render_angle)
+                out = _composite_premultiplied(out, wrgb, wa, render_opacity)
+
+            # Pass 2: render the flying sticker (top -> slice, with fade-out).
+            if flying_idx >= 0:
+                slot = queue[flying_idx]
+                premul, alpha, content_bbox = objects[slot]
+                c_x, c_y, c_w, c_h = content_bbox
+                slice_x, slice_y, slice_w, slice_h = slice_bboxes[flying_idx]
+                hold_n = flight_frames
+                elapsed = hold_n - flying_remaining
+                t = float(elapsed) / float(max(1, hold_n - 1))
+                ease = _ease_out_cubic(t)
+                # Flight start: top of left column.
+                sh_, sw_ = alpha.shape
+                menu_scale = menu_h_px / float(max(1, sh_))
+                start_cx = menu_x * w
+                start_cy = top_y_px
+                start_content_x = start_cx + (c_x + c_w / 2.0 - sw_ / 2.0) * menu_scale - c_w * menu_scale / 2.0
+                start_content_y = start_cy + (c_y + c_h / 2.0 - sh_ / 2.0) * menu_scale - c_h * menu_scale / 2.0
+                start_content_w = c_w * menu_scale
+                start_content_h = c_h * menu_scale
+                end_content_x = float(slice_x)
+                end_content_y = float(slice_y)
+                end_content_w = float(slice_w)
+                end_content_h = float(slice_h)
+                target_x = start_content_x + (end_content_x - start_content_x) * ease
+                target_y = start_content_y + (end_content_y - start_content_y) * ease
+                target_w = start_content_w + (end_content_w - start_content_w) * ease
+                target_h = start_content_h + (end_content_h - start_content_h) * ease
+                wrgb, wa = _render_object_bbox(premul, alpha, w, h,
+                                               target_x, target_y, target_w, target_h,
+                                               content_x=c_x, content_y=c_y,
+                                               content_w=c_w, content_h=c_h)
+                if t < 0.7:
+                    opacity = 1.0
+                else:
+                    opacity = max(0.0, 1.0 - (t - 0.7) / 0.3)
+                out = _composite_premultiplied(out, wrgb, wa, opacity)
+
+            output.append(out)
+            frames_rendered += 1
+
+            # --- State update ---
+            if flying_idx >= 0:
+                flying_remaining -= 1
+                if flying_remaining <= 0:
+                    states[flying_idx] = "done"
+                    flying_idx = -1
+
+            # Advance the remaining queue by one shared delta so spacing is preserved.
+            # If the front sticker reaches the top while another one is still flying,
+            # freeze the whole queue there instead of letting it overshoot.
+            rising_indices = [i for i in range(n_stickers) if states[i] == "rising"]
+            if rising_indices:
+                front_idx = rising_indices[0]
+                rise_delta = min(max(0.0, cur_speed), max(0.0, sticker_y[front_idx] - top_y_px))
+                for i in rising_indices:
+                    sticker_y[i] -= rise_delta
+
+            # video_0 ends with all three introduction stickers visible. Trigger the
+            # first flight immediately after its last frame; later flights trigger when
+            # the next rising sticker reaches sticker 0's original top position.
+            trigger_idx = None
+            if flying_idx < 0:
+                if video_seg == 0 and video_fi + 1 >= intro_len:
+                    trigger_idx = 0
+                elif video_seg > 0:
+                    for i in range(n_stickers):
+                        if states[i] != "rising":
+                            continue
+                        if sticker_y[i] <= top_y_px:
+                            trigger_idx = i
+                        break  # only check the topmost remaining sticker
+
+            if trigger_idx is not None:
+                states[trigger_idx] = "flying"
+                flying_idx = trigger_idx
+                flying_remaining = flight_frames
+                # The next loop starts at frame 0 of the changed outfit video.
+                video_seg = trigger_idx + 1
+                video_fi = -1
+                # The next sticker reaches the top over the duration of this video, but
+                # never before the current flight animation has completed.
+                next_top = None
+                for j in range(trigger_idx + 1, n_stickers):
+                    if states[j] == "rising":
+                        next_top = j
+                        break
+                if next_top is not None and video_seg < len(videos):
+                    rise_frames = max(1, len(videos[video_seg]), flight_frames)
+                    cur_speed = (sticker_y[next_top] - top_y_px) / float(rise_frames)
+                else:
+                    cur_speed = 0.0
+
+            video_fi += 1
+
+        return (_to_tensor(np.stack(output)),)
+
+
 class DressMorphMP4Saver:
     @classmethod
     def INPUT_TYPES(cls):
@@ -889,9 +1160,11 @@ def _clean_mask(mask, threshold, feather_px, cleanup_px):
 
 
 def _make_white_outline(rgb, alpha, outline_px):
-    radius = max(0, int(outline_px))
-    if radius == 0:
+    # outline_px < 0 = no outline; outline_px = 0 = 1px outline (minimum);
+    # outline_px > 0 = N px outline.
+    if int(outline_px) < 0:
         return rgb.copy(), alpha.copy()
+    radius = max(1, int(outline_px))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
     expanded = cv2.dilate(alpha, kernel)
     expanded = np.clip(expanded, 0.0, 1.0)
@@ -910,7 +1183,7 @@ class LiteCutoutSticker:
         return {"required": {
             "image": ("IMAGE",),
             "threshold": ("FLOAT", {"default": 0.45, "min": 0.05, "max": 0.95, "step": 0.01}),
-            "outline_px": ("INT", {"default": 5, "min": 0, "max": 80, "step": 1}),
+            "outline_px": ("INT", {"default": 5, "min": -1, "max": 80, "step": 1}),
             "feather_px": ("INT", {"default": 2, "min": 0, "max": 20, "step": 1}),
             "cleanup_px": ("INT", {"default": 1, "min": 0, "max": 12, "step": 1}),
         }}
@@ -944,6 +1217,7 @@ NODE_CLASS_MAPPINGS = {
     "DM_StickerFly": DressMorphStickerFly,
     "DM_ClickSwap": DressMorphClickSwap,
     "DM_Sequence": DressMorphSequence,
+    "DM_LeftRise": DressMorphLeftRise,
     "DM_MP4Saver": DressMorphMP4Saver,
     "LC_Sticker": LiteCutoutSticker,
 }
@@ -953,6 +1227,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DM_StickerFly": "DM 贴纸飞入换装",
     "DM_ClickSwap": "DM 点击拾取换装",
     "DM_Sequence": "DM 六贴图连续点击",
+    "DM_LeftRise": "DM 左侧贴图飞升换装",
     "DM_MP4Saver": "DM 导出 MP4",
     "LC_Sticker": "LC 抠图描白边（U²-Net Lite）",
 }
